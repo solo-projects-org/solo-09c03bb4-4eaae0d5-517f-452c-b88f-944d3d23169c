@@ -77,6 +77,33 @@ CREATE TABLE IF NOT EXISTS result_lot (
 CREATE INDEX IF NOT EXISTS idx_result_lot_batch ON result_lot(result_batch_id);
 CREATE INDEX IF NOT EXISTS idx_result_lot_code ON result_lot(result_batch_id, end_code);
 
+-- 回查（按公告生效日 + 旧代码追溯期初来源）的准备状态，每个结果批次一行。
+-- 首次回查时可准备该批查询数据；失败仅记 failed，原表照查并可重试。
+-- 记录持久化在数据库中，服务重启后仍可直接查询。
+CREATE TABLE IF NOT EXISTS lookup_prep (
+    result_batch_id INTEGER PRIMARY KEY REFERENCES result_batch(id),
+    status          TEXT NOT NULL CHECK (status IN ('ready', 'failed')),
+    indexed_sources INTEGER NOT NULL DEFAULT 0,
+    indexed_steps   INTEGER NOT NULL DEFAULT 0,
+    note            TEXT,
+    prepared_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- 回查索引：把 result_lot.path_json 中每一步 (生效日, 旧代码 -> 新代码)
+-- 展开成行，命中即定位到经过该公告的期初来源明细；只保存命中所需的来源明细。
+CREATE TABLE IF NOT EXISTS lookup_index (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    result_batch_id INTEGER NOT NULL REFERENCES result_batch(id),
+    lot_id          INTEGER NOT NULL REFERENCES result_lot(id),
+    effective_date  TEXT NOT NULL,
+    old_code        TEXT NOT NULL,
+    new_code        TEXT NOT NULL,
+    step_order      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lookup_query
+    ON lookup_index(result_batch_id, effective_date, old_code);
+CREATE INDEX IF NOT EXISTS idx_lookup_lot ON lookup_index(lot_id);
+
 -- 预置一份空的 active 公告批次，保证任何时候都有可引用的有效公告表；
 -- 首次上传公告时整表替换它。
 INSERT INTO announcement_batch (status, filename, row_count, note)

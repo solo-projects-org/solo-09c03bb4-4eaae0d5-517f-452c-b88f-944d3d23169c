@@ -16,9 +16,12 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from .csv_utils import CsvError, parse_form_date
 from .services import (
     canon,
+    get_lookup_prep,
     get_net_change,
     list_history,
+    prepare_lookup,
     replace_announcements,
+    trace_announcement,
     upload_holding,
 )
 
@@ -50,6 +53,9 @@ def index():
         batches=batches,
         holdings=holdings,
         canon=canon,
+        lookup=None,
+        lookup_form=None,
+        lookup_prep=None,
     )
 
 
@@ -92,6 +98,24 @@ def result_detail(result_id: int):
     if result is None:
         abort(404)
     results, batches, holdings = list_history()
+
+    # 公告回查：输入公告生效日 + 旧代码，从所选批次已保存明细追溯期初来源
+    lookup = None
+    lookup_form = {"effective_date": "", "old_code": ""}
+    eff = request.args.get("effective_date", "")
+    old = request.args.get("old_code", "")
+    if eff or old:
+        lookup_form = {"effective_date": eff, "old_code": old}
+        try:
+            lookup = trace_announcement(result_id, eff, old)
+            if lookup.attempted_prepare:
+                if lookup.used_index:
+                    flash("已为该结果批次准备回查数据，本次起走持久化索引查询。", "success")
+                else:
+                    flash("回查数据准备失败，本次按原表扫描查询；可点击“准备/重试”后再查。", "error")
+        except CsvError as exc:
+            flash(f"回查条件有误：{exc}。", "error")
+
     return render_template(
         "index.html",
         result=result,
@@ -100,7 +124,30 @@ def result_detail(result_id: int):
         batches=batches,
         holdings=holdings,
         canon=canon,
+        lookup=lookup,
+        lookup_form=lookup_form,
+        lookup_prep=get_lookup_prep(result_id),
     )
+
+
+@bp.route("/results/<int:result_id>/prepare-lookup", methods=["POST"])
+def prepare_lookup_route(result_id: int):
+    """手动准备（或失败后重试）该结果批次的回查数据。"""
+    result, _rows = get_net_change(result_id)
+    if result is None:
+        abort(404)
+    try:
+        info = prepare_lookup(result_id)
+        flash(
+            f"回查数据准备完成：{info['indexed_sources']} 条来源、"
+            f"{info['indexed_steps']} 条公告步骤，重启后仍可直接查询。",
+            "success",
+        )
+    except CsvError as exc:
+        flash(f"回查数据准备失败：{exc}。原表仍可照常查询。", "error")
+    except Exception as exc:  # pragma: no cover - 兜底
+        flash(f"回查数据准备失败：{exc}。原表仍可照常查询，可重试。", "error")
+    return redirect(url_for("main.result_detail", result_id=result_id))
 
 
 @bp.app_template_filter("d")

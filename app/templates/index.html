@@ -92,8 +92,113 @@
   {% endif %}
 </div>
 
+{% if result %}
+<div class="card" id="lookup">
+  <h2 style="margin-top:0">4. 公告回查
+    <span class="muted">— 在结果批次 #{{ result.id }} 已保存的明细中追溯（切换批次不影响本页取数）</span>
+  </h2>
+
+  {% set prep = lookup_prep %}
+  <p class="muted">
+    回查数据状态：
+    {% if prep is none %}
+      <span class="tag pending">未准备</span>
+      首次回查将自动准备该批查询数据；也可手动准备。
+    {% elif prep.status == 'ready' %}
+      <span class="tag active">已就绪</span>
+      {{ prep.note }}（{{ prep.prepared_at }}）
+    {% else %}
+      <span class="tag failed">准备失败</span>
+      {{ prep.note }} —— 回查会自动按原表扫描，仍可点“准备/重试”。
+    {% endif %}
+  </p>
+
+  <form class="inline" method="get"
+        action="{{ url_for('main.result_detail', result_id=result.id) }}#lookup">
+    <div>
+      <label>公告生效日</label>
+      <input type="date" name="effective_date" required
+             value="{{ lookup_form.effective_date if lookup_form else '' }}">
+    </div>
+    <div>
+      <label>旧代码（保留前导零）</label>
+      <input type="text" name="old_code" inputmode="text" required
+             placeholder="如 000001" value="{{ lookup_form.old_code if lookup_form else '' }}">
+    </div>
+    <button type="submit">回查经过该公告的期初来源</button>
+  </form>
+  <form method="post" style="margin-top:8px"
+        action="{{ url_for('main.prepare_lookup_route', result_id=result.id) }}">
+    <button type="submit" class="secondary">准备 / 重试该批回查数据</button>
+  </form>
+
+  {% if lookup %}
+  <div class="lookup-result">
+    <h3>回查条件：生效日 {{ lookup.effective_date }} ｜旧代码 {{ lookup.old_code }}
+      <span class="muted">（{{ '持久化索引查询' if lookup.used_index else '原表扫描查询' }}）</span>
+    </h3>
+
+    {% if not lookup.matches %}
+      <p class="muted empty">查无匹配：该结果批次中没有期初来源经过此公告（空结果）。</p>
+    {% else %}
+    <p class="muted">
+      命中 {{ lookup.matches|length }} 条期初来源；下列期末证券的折算总股数、实报股数、净变动沿用本批整表数值。
+    </p>
+    <table>
+      <thead>
+        <tr>
+          <th>期初来源代码</th>
+          <th>完整折算路径</th>
+          <th>期末代码</th>
+          <th class="num">该来源折算股数</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for m in lookup.matches %}
+        <tr>
+          <td>{{ m.origin_code }}</td>
+          <td>
+            {{ m.path }}
+            {% for s in m.steps %}
+              <p class="detail">{{ s.effective_date }}：{{ s.old_code }} → {{ s.new_code }}（{{ s.ratio }}:1）</p>
+            {% endfor %}
+          </td>
+          <td>{{ m.end_code }}</td>
+          <td class="num">{{ m.adjusted_shares | d }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <h3>相关期末证券汇总（沿用本批整表）</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>期末代码</th>
+          <th class="num">折算总股数</th>
+          <th class="num">实报股数</th>
+          <th class="num">净变动（实报 − 折算）</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in lookup.summaries %}
+        <tr>
+          <td>{{ s.end_code }}</td>
+          <td class="num">{{ s.adjusted_shares | d }}</td>
+          <td class="num">{{ s.reported_shares | d }}</td>
+          <td class="num">{{ s.net_change | d }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endif %}
+
 <div class="card">
-  <h2 style="margin-top:0">4. 历史版本（换报失败仍可查原表）</h2>
+  <h2 style="margin-top:0">5. 历史版本（换报失败仍可查原表）</h2>
   <h3>结果批次</h3>
   <table>
     <thead><tr><th>#</th><th>区间</th><th>公告批次</th><th>触发说明</th><th>生成时间</th><th></th></tr></thead>

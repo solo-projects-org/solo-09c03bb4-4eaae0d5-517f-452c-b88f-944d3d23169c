@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 from typing import Optional
 
@@ -529,3 +530,236 @@ def list_history():
         "SELECT * FROM holding_file ORDER BY id DESC"
     ).fetchall()
     return results, batches, holdings
+
+
+# ---------------------------------------------------------------- 公告回查
+#
+# 研究员核对换股公告时，输入【公告生效日 + 旧代码】，从所选结果批次已保存的
+# result_lot 明细中找出“经过这条公告”的期初来源，列出完整折算路径与折算股数。
+#
+# - 明细只列命中的来源；相关期末证券的折算总股数、实报股数、净变动沿用该批整表数值。
+# - 首次回查可准备该批的查询数据（lookup_index）；准备失败时原表（result_lot）
+#   照查并可重试。准备结果持久化在数据库中，服务重启后也能直接查。
+# - 旧库无需重传：lookup_prep / lookup_index 由建表脚本以 IF NOT EXISTS 补齐。
+
+
+def _upsert_prep(conn, result_id: int, status: str, note: str,
+                 sources: int = 0, steps: int = 0) -> None:
+    """跨 SQLite 版本兼容的 lookup_prep upsert。"""
+    existing = conn.execute(
+        "SELECT 1 FROM lookup_prep WHERE result_batch_id=?", (result_id,)
+    ).fetchone()
+    if existing is None:
+        conn.execute(
+            "INSERT INTO lookup_prep "
+            "(result_batch_id, status, indexed_sources, indexed_steps, note, prepared_at) "
+            "VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            (result_id, status, sources, steps, note),
+        )
+    else:
+        conn.execute(
+            "UPDATE lookup_prep SET status=?, indexed_sources=?, indexed_steps=?, "
+            "note=?, prepared_at=datetime('now') WHERE result_batch_id=?",
+            (status, sources, steps, note, result_id),
+        )
+
+
+def prepare_lookup(result_id: int) -> dict:
+    """为指定结果批次准备回查数据：把每个来源折算路径中的每一步展开入索引。
+
+    成功返回 {"status": "ready", ...}；准备过程失败时登记 failed 并抛出，
+    原 result_lot 表完全不动，回查会回退到原表扫描，且可重试。
+    """
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        batch = conn.execute(
+            "SELECT id FROM result_batch WHERE id=?", (result_id,)
+        ).fetchone()
+        if batch is None:
+            conn.rollback()
+            raise CsvError(f"结果批次 #{result_id} 不存在")
+
+        # 重建该批索引，保证重试后与当前 result_lot 完全一致
+        conn.execute(
+            "DELETE FROM lookup_index WHERE result_batch_id=?", (result_id,)
+        )
+        conn.execute(
+            "DELETE FROM lookup_prep WHERE result_batch_id=?", (result_id,)
+        )
+
+        lots = conn.execute(
+            "SELECT id, path_json FROM result_lot WHERE result_batch_id=?",
+            (result_id,),
+        ).fetchall()
+
+        index_rows = []
+        touched_sources = set()
+        for lot in lots:
+            steps = json.loads(lot["path_json"])
+            for order, (eff, old, new, _ratio) in enumerate(steps):
+                index_rows.append(
+                    (result_id, lot["id"], eff, old, new, order)
+                )
+                touched_sources.add(lot["id"])
+        conn.executemany(
+            "INSERT INTO lookup_index "
+            "(result_batch_id, lot_id, effective_date, old_code, new_code, step_order) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            index_rows,
+        )
+        _upsert_prep(
+            conn,
+            result_id,
+            "ready",
+            f"回查数据已准备：{len(touched_sources)} 条来源、{len(index_rows)} 条公告步骤",
+            sources=len(touched_sources),
+            steps=len(index_rows),
+        )
+        conn.commit()
+        return get_lookup_prep(result_id)
+    except Exception:
+        conn.rollback()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "DELETE FROM lookup_index WHERE result_batch_id=?", (result_id,)
+            )
+            _upsert_prep(conn, result_id, "failed", "回查数据准备失败，回退原表查询")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+        raise
+
+
+def get_lookup_prep(result_id: int) -> Optional[dict]:
+    """返回某结果批次的回查准备状态；从未准备时返回 None。"""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM lookup_prep WHERE result_batch_id=?", (result_id,)
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+@dataclass
+class LookupMatch:
+    origin_code: str
+    end_code: str
+    adjusted_shares: Decimal
+    path: str
+    steps: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class LookupResult:
+    effective_date: str
+    old_code: str
+    result_id: int
+    used_index: bool
+    prep: Optional[dict]
+    matches: list[LookupMatch]
+    summaries: list["NetChangeRow"]
+    attempted_prepare: bool = False
+
+
+def _valid_iso_date(value: str) -> bool:
+    try:
+        date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _build_match(lot_row) -> LookupMatch:
+    steps = json.loads(lot_row["path_json"])
+    return LookupMatch(
+        origin_code=lot_row["origin_code"],
+        end_code=lot_row["end_code"],
+        adjusted_shares=Decimal(lot_row["adjusted_shares"]),
+        path=_format_path(lot_row["path_json"]),
+        # path_json 落库时比例已规范化为字符串，这里直接透传
+        steps=[
+            {"effective_date": d, "old_code": o, "new_code": n, "ratio": r}
+            for d, o, n, r in steps
+        ],
+    )
+
+
+def _scan_matching_lots(conn, result_id: int, eff: str, old: str) -> list:
+    """回退路径：直接解析该批 result_lot 的 path_json 找出命中来源（原表照查）。"""
+    lots = conn.execute(
+        "SELECT * FROM result_lot WHERE result_batch_id=? ORDER BY origin_code",
+        (result_id,),
+    ).fetchall()
+    hits = []
+    for lot in lots:
+        steps = json.loads(lot["path_json"])
+        if any(s[0] == eff and s[1] == old for s in steps):
+            hits.append(_build_match(lot))
+    return hits
+
+
+def trace_announcement(
+    result_id: int,
+    effective_date: str,
+    old_code: str,
+    auto_prepare: bool = True,
+) -> LookupResult:
+    """在指定结果批次内，按公告生效日 + 旧代码回查经过该公告的期初来源。
+
+    - 首次回查（无准备记录）时自动准备该批查询数据；准备失败回退原表扫描。
+    - 已 ready：走持久化索引；failed 或未就绪：原表照查。
+    - 明细只含命中来源；期末证券汇总沿用该批整表（get_net_change）数值。
+    """
+    eff = (effective_date or "").strip()
+    old = (old_code or "").strip()
+    if not eff or not _valid_iso_date(eff):
+        raise CsvError("公告生效日必须为 YYYY-MM-DD 日期")
+    if not old:
+        raise CsvError("旧代码不能为空")
+
+    conn = get_db()
+    batch = conn.execute(
+        "SELECT id FROM result_batch WHERE id=?", (result_id,)
+    ).fetchone()
+    if batch is None:
+        raise CsvError(f"结果批次 #{result_id} 不存在")
+
+    prep = get_lookup_prep(result_id)
+    attempted_prepare = False
+    if auto_prepare and prep is None:
+        # 首次回查：准备该批查询数据；失败不影响查询，回退原表
+        attempted_prepare = True
+        try:
+            prep = prepare_lookup(result_id)
+        except Exception:
+            prep = get_lookup_prep(result_id)
+
+    used_index = prep is not None and prep["status"] == "ready"
+    if used_index:
+        lot_rows = conn.execute(
+            "SELECT rl.* FROM lookup_index li "
+            "JOIN result_lot rl ON rl.id = li.lot_id "
+            "WHERE li.result_batch_id=? AND li.effective_date=? AND li.old_code=? "
+            "GROUP BY rl.id ORDER BY rl.origin_code",
+            (result_id, eff, old),
+        ).fetchall()
+        matches = [_build_match(r) for r in lot_rows]
+    else:
+        matches = _scan_matching_lots(conn, result_id, eff, old)
+
+    # 相关期末证券的汇总沿用该批整表数值（折算总股数/实报/净变动）
+    _result, all_rows = get_net_change(result_id)
+    hit_end_codes = {m.end_code for m in matches}
+    summaries = [row for row in all_rows if row.end_code in hit_end_codes]
+
+    return LookupResult(
+        effective_date=eff,
+        old_code=old,
+        result_id=result_id,
+        used_index=used_index,
+        prep=prep,
+        matches=matches,
+        summaries=summaries,
+        attempted_prepare=attempted_prepare,
+    )
